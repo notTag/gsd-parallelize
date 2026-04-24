@@ -1,7 +1,8 @@
 ---
 name: gsd-parallelize
+version: 0.1.1
 description: "Analyze .planning/ roadmap and split phases into non-dependent workstreams for parallel engineer handoff. Dry-run by default; --apply materializes workstreams via gsd-sdk."
-argument-hint: "[--apply] [--scope roadmap|backlog|all]"
+argument-hint: "[--apply] [--scope roadmap|backlog|all] [--analyze-partial]"
 allowed-tools:
   - Read
   - Bash
@@ -19,6 +20,7 @@ Split a GSD project's phases into non-dependent **workstreams** so multiple engi
 
 - `--apply` — Materialize workstreams. Without it, skill runs dry-run and writes `PARALLELIZATION.md` only.
 - `--scope` — `roadmap` (active milestone), `backlog` (999.x items), or `all` (default).
+- `--analyze-partial` — Deep analysis pass. For every phase with a hard dep, estimate the fraction of work that can be done in parallel with its upstream phase (before the dep actually blocks). Adds two columns to `PARALLELIZATION.md`: **Unblocked scope** (what the X% entails) and **Blocked scope** (what the remaining 100-X% entails). Costs one extra analysis pass per hard-dep phase. See Step 2.5.
 
 v2-reserved (not implemented in v1): `--split=skip|auto|recommend` for sub-phase splitting.
 
@@ -62,6 +64,68 @@ Algorithm:
 1. Union-find across all edges → connected components = workstreams.
 2. Within each component, topologically sort by hard edges → phase execution order.
 3. Across components, detect cross-component hard edges — these are rare (soft edges should have merged them) but possible when e.g. ws-api exposes an interface ws-ui consumes. Record as **suggested merge order** (producer workstream merges before consumer).
+
+### Linear-chain detection
+
+After the graph is built, check if every non-foundation phase has a hard dep on phase `N-1` (strict linear chain). If so, and `--analyze-partial` was **not** passed, emit a hint at the top of the dry-run report:
+
+> **Linear chain detected.** Every phase hard-depends on its predecessor → only 1 workstream possible under strict dependency semantics. Many phases may still be partially parallelizable (e.g. scaffolding, independent compute, eval harness setup can begin before upstream ships). Re-run with `--analyze-partial` to estimate per-phase unblocked fraction and see what can be started early vs. what must wait.
+
+This hint is informational — the skill still writes `PARALLELIZATION.md` with its strict-dep result. Do not emit the hint if `--analyze-partial` is already set, or if the graph is not a strict linear chain (some parallelism already detected).
+
+## Step 2.5 — Partial analysis (only if `--analyze-partial`)
+
+For each phase that has at least one hard dep, estimate its **unblocked fraction** — the percentage of phase work that can run in parallel with its upstream phase(s), before integration/eval forces a pause.
+
+### Signal sources (ranked)
+
+1. **PLAN.md task list** — if present, read every task and its referenced files. Best signal.
+2. **SPEC.md scope + deliverables** — fallback when PLAN.md does not yet exist. Coarser estimate; flag confidence as `low`.
+3. **ROADMAP.md phase summary** — last resort. Flag confidence as `very-low`.
+
+### Classification
+
+Classify each task (or deliverable, when only SPEC is available) into one of three buckets:
+
+- **independent** — consumes no upstream artifact. Examples: schema migrations, dependency installs, test fixtures, independent compute pipelines, scaffolding, new table creation, library scaffolds.
+- **partial** — needs an upstream interface or contract shape, but not upstream runtime output. Can stub against the interface and integrate later.
+- **blocked** — needs upstream runtime output, tested code, or a merged DTO/explainability surface. Cannot be completed without upstream shipping.
+
+**Unblocked fraction** = (`independent` + `partial`) / total, weighted by rough effort estimate if task size is obvious; otherwise equal-weighted and flagged as `equal-weighted`.
+
+### Output per phase
+
+For each hard-dep phase, produce a record:
+
+```yaml
+phase: 4
+title: "Complementarity (Deck Co-occurrence)"
+hard_deps: [3]
+unblocked_pct: 75
+confidence: medium  # high | medium | low | very-low
+weighting: equal-weighted  # or effort-weighted
+unblocked_scope:
+  - "Schema + migration for card_pair_cooccurrence table"
+  - "Deck ingest loader (reads from upstream-of-P3 fixtures)"
+  - "PMI + Jaccard compute kernels"
+  - "Held-out eval harness wiring"
+blocked_scope:
+  - "Explainability DTO alignment with P3's scoring output"
+  - "Final eval comparing hybrid P3+P4 signal vs P3-only baseline"
+blocks_because:
+  - "Explainability DTO: P3 establishes the pattern P4's surface must conform to"
+  - "Hybrid eval: needs P3's scored outputs as a comparison baseline"
+```
+
+These records feed the expanded `PARALLELIZATION.md` template (see Step 4) and the final summary table (Step 6).
+
+### Split-candidate flagging
+
+If `unblocked_pct >= 60` AND `confidence >= medium`, flag the phase as a **split candidate**. The skill does NOT auto-split — it only suggests. Sub-phase splitting remains v2 (`--split`).
+
+### Cost note
+
+Each hard-dep phase adds one analysis pass. For an 8-phase linear chain that is 7 extra passes. The `--analyze-partial` flag is opt-in precisely for this reason. The linear-chain hint in Step 2 points users here when the investment is likely to pay off.
 
 ## Step 3 — Name workstreams
 
@@ -112,9 +176,23 @@ Scope: <roadmap|backlog|all>
 
 - **Phase 4 (12 plans)** — consider splitting via `/gsd-insert-phase`. Candidates: plans 1-5 are file-disjoint from plans 6-12.
 
+## Partial-Completion Analysis
+
+_Only emitted when `--analyze-partial` was passed._
+
+| Phase | Hard deps | Unblocked % | Confidence | Unblocked scope (can start early) | Blocked scope (must wait on upstream) |
+|---|---|---|---|---|---|
+| 4 — Complementarity | 3 | 75% | medium | Schema + migration; deck ingest loader; PMI/Jaccard compute; held-out eval harness | Explainability DTO alignment w/ P3 output; final hybrid eval vs P3 baseline |
+| 5 — Directional Semantics | 4 | 40% | medium | Telemetry table + emitter; query-log schema | Directional scoring (needs P4 co-occurrence); feedback integration |
+| 7 — REST API | 6 | 70% | high | OpenAPI spec; handler scaffolds; auth middleware; contract tests against stubs | Wiring to real gateway (P6); E2E tests |
+
+**Split candidates** (unblocked ≥60% AND confidence ≥medium): Phase 4, Phase 7. Sub-phase split not auto-applied — see v2 `--split` flag.
+
+**Why "blocked" entries block:** brief rationale per phase. Example — Phase 4 blocks on explainability DTO because P3 establishes the pattern P4's DTO must conform to.
+
 ## Unplanned Phases (no PLAN.md)
 
-- Phase 9 — skipped from file-overlap analysis, grouped by explicit deps only.
+- Phase 9 — skipped from file-overlap analysis, grouped by explicit deps only. Partial-analysis confidence for unplanned phases is `low` or `very-low` (SPEC-only / ROADMAP-only signal).
 ```
 
 Commit this file in dry-run mode — it's useful on its own.
@@ -156,6 +234,20 @@ Print a summary table:
 | auth | 3, 7 | 4 | - | 1st |
 | api | 4, 8 | 6 | auth#3 | 2nd |
 
+If `--analyze-partial` was passed, print a second table:
+
+| Phase | Hard deps | Unblocked % | Confidence | Split candidate? |
+|---|---|---|---|---|
+| 4 | 3 | 75% | medium | yes |
+| 5 | 4 | 40% | medium | no |
+| 7 | 6 | 70% | high | yes |
+
+Full unblocked/blocked scope per phase lives in `PARALLELIZATION.md` — the terminal summary is just the headline numbers.
+
+If the input was a strict linear chain and `--analyze-partial` was NOT passed, print the same hint written to the file:
+
+> Linear chain detected. Re-run with `--analyze-partial` to estimate per-phase unblocked fraction.
+
 Print handoff instructions:
 > Push to remote: `git push origin main`
 > Engineers clone repo and run: `/gsd-resume-work --ws <name>`
@@ -166,7 +258,8 @@ Print handoff instructions:
 - **Never** delete phases from the canonical milestone dir.
 - **Never** push commits. Local commit only; user decides when to push.
 - If `gsd-sdk workstream.create` fails, stop the loop — do not continue creating siblings. Report partial state so user can clean up manually.
-- Dry-run output (`PARALLELIZATION.md`) must be **idempotent** — running dry-run twice produces the same file.
+- Dry-run output (`PARALLELIZATION.md`) must be **idempotent** — running dry-run twice produces the same file. Partial-analysis classifications may vary slightly run-to-run (LLM non-determinism); record confidence + classification bucket but do not promise stable percentages across reruns.
+- `--analyze-partial` is **read-only advisory**. It never mutates ROADMAP.md, phase files, or dependency declarations. It only enriches `PARALLELIZATION.md` with advisory columns.
 
 ## Non-goals (v1)
 
